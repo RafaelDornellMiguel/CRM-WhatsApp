@@ -1,222 +1,90 @@
-/**
- * Webhook Handler para Evolution API
- * Recebe eventos do WhatsApp (mensagens, status de conexão, etc)
- */
-
 import { Request, Response } from 'express';
-import { getDb } from './db';
-import { mensagens, contatos } from '../drizzle/schema';
+import { db } from './db';
+import { mensagens, contatos, numerosWhatsapp } from '../drizzle/schema';
 import { eq } from 'drizzle-orm';
 
-interface WebhookMessage {
-  key: {
-    remoteJid: string;
-    fromMe: boolean;
-    id: string;
-  };
-  message: {
-    conversation?: string;
-    extendedTextMessage?: {
-      text: string;
-    };
-    imageMessage?: {
-      url: string;
-      caption?: string;
-    };
-    videoMessage?: {
-      url: string;
-      caption?: string;
-    };
-    audioMessage?: {
-      url: string;
-    };
-    documentMessage?: {
-      url: string;
-      fileName?: string;
-    };
-  };
-  messageTimestamp: number;
-  pushName?: string;
-}
-
+// ... interfaces mantidas ...
 interface WebhookPayload {
   event: string;
   instance: string;
-  data: {
-    key: {
-      remoteJid: string;
-      fromMe: boolean;
-      id: string;
-    };
-    message?: any;
-    messageTimestamp?: number;
-    pushName?: string;
-  };
+  data: any;
 }
 
-/**
- * Extrair texto da mensagem
- */
-function extractMessageText(message: any): string {
-  if (message.conversation) {
-    return message.conversation;
-  }
-  if (message.extendedTextMessage?.text) {
-    return message.extendedTextMessage.text;
-  }
-  if (message.imageMessage?.caption) {
-    return message.imageMessage.caption;
-  }
-  if (message.videoMessage?.caption) {
-    return message.videoMessage.caption;
-  }
-  if (message.documentMessage?.fileName) {
-    return `Documento: ${message.documentMessage.fileName}`;
-  }
-  if (message.audioMessage) {
-    return '[Áudio]';
-  }
-  return '[Mensagem sem texto]';
-}
-
-/**
- * Extrair tipo de mídia
- */
-function extractMediaType(message: any): 'text' | 'image' | 'video' | 'audio' | 'document' {
-  if (message.imageMessage) return 'image';
-  if (message.videoMessage) return 'video';
-  if (message.audioMessage) return 'audio';
-  if (message.documentMessage) return 'document';
-  return 'text';
-}
-
-/**
- * Extrair URL de mídia
- */
-function extractMediaUrl(message: any): string | null {
-  if (message.imageMessage?.url) return message.imageMessage.url;
-  if (message.videoMessage?.url) return message.videoMessage.url;
-  if (message.audioMessage?.url) return message.audioMessage.url;
-  if (message.documentMessage?.url) return message.documentMessage.url;
-  return null;
-}
-
-/**
- * Handler principal do webhook
- */
 export async function handleWebhook(req: Request, res: Response) {
   try {
     const payload: WebhookPayload = req.body;
+    
+    // Log mais limpo
+    if (payload.event !== 'qrcode.updated') { 
+        console.log(`[Webhook] Event: ${payload.event} | Instance: ${payload.instance}`);
+    }
 
-    console.log('[Webhook] Evento recebido:', payload.event);
-    console.log('[Webhook] Instância:', payload.instance);
-    console.log('[Webhook] Dados:', JSON.stringify(payload.data, null, 2));
-
-    // Processar apenas mensagens recebidas
     if (payload.event === 'messages.upsert') {
       await processIncomingMessage(payload);
     }
-
-    // Processar status de conexão
-    if (payload.event === 'connection.update') {
-      await processConnectionUpdate(payload);
-    }
-
+    
+    // Precisamos retornar 200 rápido para a Evolution não tentar reenviar
     res.status(200).json({ success: true });
   } catch (error) {
-    console.error('[Webhook] Erro ao processar webhook:', error);
-    res.status(500).json({ success: false, error: 'Erro ao processar webhook' });
+    console.error('[Webhook Error]', error);
+    res.status(500).json({ success: false });
   }
 }
 
-/**
- * Processar mensagem recebida
- */
 async function processIncomingMessage(payload: WebhookPayload) {
-  const db = await getDb();
-  if (!db) {
-    console.warn('[Webhook] Banco de dados não disponível');
-    return;
-  }
-
   const { data, instance } = payload;
-  const { key, message, messageTimestamp, pushName } = data;
+  const { key, message, pushName } = data;
 
-  // Ignorar mensagens enviadas por nós
-  if (key.fromMe) {
-    console.log('[Webhook] Mensagem enviada por nós, ignorando');
+  if (key.fromMe) return; // Ignora msg enviada pelo próprio sistema
+
+  // 1. Descobrir qual é a empresa dona dessa instância
+  const [conexao] = await db
+    .select()
+    .from(numerosWhatsapp)
+    .where(eq(numerosWhatsapp.nome, instance))
+    .limit(1);
+
+  if (!conexao) {
+    console.warn(`[Webhook] Instância '${instance}' não encontrada no banco. Ignorando msg.`);
     return;
   }
 
-  // Extrair número do contato (remover @s.whatsapp.net)
-  const phoneNumber = key.remoteJid.replace('@s.whatsapp.net', '');
+  const tenantId = conexao.tenantId; // Agora temos o ID da empresa correto!
 
-  // Verificar se contato existe, senão criar
-  let contact = await db
+  // 2. Processar Contato
+  const phoneNumber = key.remoteJid.replace('@s.whatsapp.net', '');
+  
+  let [contact] = await db
     .select()
     .from(contatos)
     .where(eq(contatos.telefone, phoneNumber))
     .limit(1);
 
-  if (contact.length === 0) {
-    // Criar novo contato
-    await db.insert(contatos).values({
-      tenantId: 1, // TODO: Obter tenantId correto baseado na instância
+  if (!contact) {
+    const result = await db.insert(contatos).values({
+      tenantId,
       nome: pushName || phoneNumber,
       telefone: phoneNumber,
       status: 'novo',
-      ticketStatus: 'aberto',
-      createdAt: new Date(),
-      updatedAt: new Date(),
     });
-
-    // Buscar contato recém-criado
-    contact = await db
-      .select()
-      .from(contatos)
-      .where(eq(contatos.telefone, phoneNumber))
-      .limit(1);
+    // Busca o contato criado
+    [contact] = await db.select().from(contatos).where(eq(contatos.id, Number(result[0].insertId)));
   }
 
-  if (contact.length === 0) {
-    console.error('[Webhook] Erro ao criar/buscar contato');
-    return;
-  }
+  // 3. Salvar Mensagem
+  // Extração simples de texto (pode melhorar com helpers)
+  const text = message.conversation || message.extendedTextMessage?.text || message.imageMessage?.caption || "[Mídia]";
+  const tipo = message.imageMessage ? 'imagem' : message.audioMessage ? 'audio' : 'texto';
 
-  const contactId = contact[0].id;
-
-  // Extrair informações da mensagem
-  const messageText = extractMessageText(message);
-  const mediaType = extractMediaType(message);
-  const mediaUrl = extractMediaUrl(message);
-
-  // Salvar mensagem no banco
   await db.insert(mensagens).values({
-    tenantId: 1, // TODO: Obter tenantId correto baseado na instância
-    contatoId: contactId,
-    vendedorId: null,
+    tenantId,
+    contatoId: contact.id,
     remetente: 'contato',
-    conteudo: messageText,
-    tipo: mediaType === 'text' ? 'texto' : mediaType === 'image' ? 'imagem' : mediaType === 'audio' ? 'audio' : 'arquivo',
-    arquivoUrl: mediaUrl,
+    conteudo: text,
+    tipo,
     lida: false,
     createdAt: new Date(),
   });
-
-  console.log('[Webhook] Mensagem salva no banco:', {
-    contactId,
-    phoneNumber,
-    messageText,
-    mediaType,
-  });
-}
-
-/**
- * Processar atualização de conexão
- */
-async function processConnectionUpdate(payload: WebhookPayload) {
-  console.log('[Webhook] Atualização de conexão:', payload.data);
   
-  // TODO: Atualizar status da conexão no banco de dados
-  // Exemplo: marcar instância como conectada/desconectada
+  console.log(`[Webhook] Msg salva para empresa ${tenantId} de ${phoneNumber}`);
 }

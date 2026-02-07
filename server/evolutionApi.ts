@@ -1,270 +1,144 @@
-/**
- * Serviço de integração com Evolution API v2
- * Documentação: https://doc.evolution-api.com/v2/pt/get-started/introduction
- */
+import axios from "axios";
 
-import axios, { AxiosInstance } from 'axios';
-
-interface EvolutionConfig {
+interface EvolutionCredentials {
   baseUrl: string;
   apiKey: string;
 }
 
-interface CreateInstancePayload {
-  instanceName: string;
-  token?: string;
-  qrcode?: boolean;
-  integration?: string;
-}
+const getClient = (creds: EvolutionCredentials) => {
+  if (!creds.baseUrl) throw new Error("URL da API não fornecida");
+  
+  const baseURL = creds.baseUrl.trim().replace(/\/$/, ""); 
+  const apiKey = creds.apiKey.trim();
 
-interface SendTextMessagePayload {
-  number: string;
-  text: string;
-}
+  return axios.create({
+    baseURL,
+    headers: {
+      "Content-Type": "application/json",
+      "apikey": apiKey,
+    },
+    timeout: 10000,
+  });
+};
 
-interface SendMediaMessagePayload {
-  number: string;
-  mediaUrl: string;
-  caption?: string;
-  mediaType: 'image' | 'video' | 'audio' | 'document';
-}
-
-interface QRCodeResponse {
-  code: string;
-  base64: string;
-}
-
-interface InstanceInfo {
-  instance: {
-    instanceName: string;
-    status: 'open' | 'close' | 'connecting';
-  };
-}
-
-interface ConnectionState {
-  instance: string;
-  state: 'open' | 'close' | 'connecting';
-}
-
-export class EvolutionApiService {
-  private client: AxiosInstance;
-  private baseUrl: string;
-  private apiKey: string;
-
-  constructor(config: EvolutionConfig) {
-    this.baseUrl = config.baseUrl;
-    this.apiKey = config.apiKey;
-
-    this.client = axios.create({
-      baseURL: this.baseUrl,
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': this.apiKey,
-      },
-      timeout: 30000,
-    });
-  }
-
-  /**
-   * Criar uma nova instância do WhatsApp
-   */
-  async createInstance(payload: CreateInstancePayload): Promise<any> {
+export const evolutionApi = {
+  async createInstance(creds: EvolutionCredentials, instanceName: string, webhookUrl?: string) {
     try {
-      const response = await this.client.post('/instance/create', {
-        instanceName: payload.instanceName,
-        token: payload.token,
-        qrcode: payload.qrcode ?? true,
-        integration: payload.integration ?? 'WHATSAPP-BAILEYS',
+      console.log(`[EVOLUTION] Criando instância '${instanceName}'...`);
+      const client = getClient(creds);
+      
+      const payload: any = {
+        instanceName: instanceName,
+        qrcode: true,
+        integration: "WHATSAPP-BAILEYS",
+        reject_call: false,
+        msg_call: "",
+        groups_ignore: true,
+        always_online: false,
+        read_messages: false,
+        read_status: false,
+      };
+
+      if (webhookUrl && webhookUrl.includes("http")) {
+        payload.webhook = webhookUrl;
+        payload.webhook_by_events = true;
+        payload.events = ["QRCODE_UPDATED", "MESSAGES_UPSERT", "MESSAGES_UPDATE", "CONNECTION_UPDATE"];
+      }
+
+      const response = await client.post("/instance/create", payload);
+      return response.data;
+
+    } catch (error: any) {
+      if (error.response) {
+        const data = error.response.data;
+        // Pega a mensagem de erro onde quer que ela esteja (string ou array)
+        const errorMessage = JSON.stringify(data);
+
+        // VERIFICAÇÃO INTELIGENTE DE "JÁ EXISTE"
+        // Se a API disser "already in use" ou "already exists", nós aceitamos como sucesso parcial
+        if (errorMessage.includes("already in use") || errorMessage.includes("already exists")) {
+            console.log("[EVOLUTION] Instância já existe. Continuando para conexão...");
+            return { alreadyExists: true };
+        }
+        
+        console.error(`[EVOLUTION ERRO] ${errorMessage}`);
+        throw new Error(data?.response?.message?.[0] || "Erro ao criar instância");
+      }
+      throw error;
+    }
+  },
+
+  async connectInstance(creds: EvolutionCredentials, instanceName: string) {
+    try {
+      const client = getClient(creds);
+      console.log(`[EVOLUTION] Buscando QR Code para '${instanceName}'...`);
+      
+      // Tenta conectar/buscar QR Code
+      const response = await client.get(`/instance/connect/${instanceName}`);
+      
+      // Às vezes o QR Code vem em lugares diferentes dependendo da versão
+      return {
+        code: response.data?.code || response.data?.base64,
+        base64: response.data?.base64 || response.data?.code
+      };
+    } catch (error: any) { 
+        console.warn(`[EVOLUTION] Não foi possível pegar QR Code agora: ${error.message}`);
+        return null; 
+    }
+  },
+  
+  async fetchInstanceStatus(creds: EvolutionCredentials, instanceName: string) {
+      try {
+          const client = getClient(creds);
+          const response = await client.get(`/instance/connectionState/${instanceName}`);
+          return response.data;
+      } catch (error: any) { return null; }
+  },
+
+  async getInstanceInfo(creds: EvolutionCredentials, instanceName: string) {
+    try {
+        const client = getClient(creds);
+        const response = await client.get(`/instance/fetchInstances/${instanceName}`);
+        return response.data;
+    } catch (error: any) { return null; }
+  },
+
+  async logoutInstance(creds: EvolutionCredentials, instanceName: string) {
+    try {
+      const client = getClient(creds);
+      await client.delete(`/instance/logout/${instanceName}`);
+    } catch (error) {}
+  },
+
+  async deleteInstance(creds: EvolutionCredentials, instanceName: string) {
+      try {
+          const client = getClient(creds);
+          await client.delete(`/instance/delete/${instanceName}`);
+      } catch (error) {}
+  },
+
+  async fetchContacts(creds: EvolutionCredentials, instanceName: string) {
+    try {
+      const client = getClient(creds);
+      const response = await client.get(`/chat/fetchContacts/${instanceName}`);
+      return response.data;
+    } catch (error: any) {
+        return [];
+    }
+  },
+
+  async sendTextMessage(creds: EvolutionCredentials, instanceName: string, number: string, text: string) {
+    try {
+      const client = getClient(creds);
+      await client.post(`/message/sendText/${instanceName}`, {
+        number,
+        text,
+        delay: 1200,
+        linkPreview: true
       });
-      return response.data;
+      return { success: true };
     } catch (error: any) {
-      console.error('[Evolution API] Erro ao criar instância:', error.response?.data || error.message);
-      throw new Error(`Falha ao criar instância: ${error.response?.data?.message || error.message}`);
+      throw new Error("Falha ao enviar mensagem");
     }
   }
-
-  /**
-   * Conectar instância e obter QR Code
-   */
-  async connectInstance(instanceName: string): Promise<QRCodeResponse> {
-    try {
-      const response = await this.client.get(`/instance/connect/${instanceName}`);
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao conectar instância:', error.response?.data || error.message);
-      throw new Error(`Falha ao conectar instância: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Obter informações da instância
-   */
-  async getInstanceInfo(instanceName: string): Promise<InstanceInfo> {
-    try {
-      const response = await this.client.get(`/instance/fetchInstances/${instanceName}`);
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao buscar instância:', error.response?.data || error.message);
-      throw new Error(`Falha ao buscar instância: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Verificar status de conexão da instância
-   */
-  async getConnectionState(instanceName: string): Promise<ConnectionState> {
-    try {
-      const response = await this.client.get(`/instance/connectionState/${instanceName}`);
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao verificar conexão:', error.response?.data || error.message);
-      throw new Error(`Falha ao verificar conexão: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Desconectar instância (logout)
-   */
-  async logoutInstance(instanceName: string): Promise<any> {
-    try {
-      const response = await this.client.delete(`/instance/logout/${instanceName}`);
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao desconectar instância:', error.response?.data || error.message);
-      throw new Error(`Falha ao desconectar instância: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Deletar instância
-   */
-  async deleteInstance(instanceName: string): Promise<any> {
-    try {
-      const response = await this.client.delete(`/instance/delete/${instanceName}`);
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao deletar instância:', error.response?.data || error.message);
-      throw new Error(`Falha ao deletar instância: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Enviar mensagem de texto
-   */
-  async sendTextMessage(instanceName: string, payload: SendTextMessagePayload): Promise<any> {
-    try {
-      const response = await this.client.post(`/message/sendText/${instanceName}`, {
-        number: payload.number,
-        text: payload.text,
-      });
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao enviar mensagem:', error.response?.data || error.message);
-      throw new Error(`Falha ao enviar mensagem: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Enviar mensagem com mídia (imagem, vídeo, áudio, documento)
-   */
-  async sendMediaMessage(instanceName: string, payload: SendMediaMessagePayload): Promise<any> {
-    try {
-      const endpoint = `/message/sendMedia/${instanceName}`;
-      const response = await this.client.post(endpoint, {
-        number: payload.number,
-        mediaUrl: payload.mediaUrl,
-        caption: payload.caption,
-        mediaType: payload.mediaType,
-      });
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao enviar mídia:', error.response?.data || error.message);
-      throw new Error(`Falha ao enviar mídia: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Buscar contatos da instância
-   */
-  async fetchContacts(instanceName: string): Promise<any> {
-    try {
-      const response = await this.client.get(`/chat/fetchContacts/${instanceName}`);
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao buscar contatos:', error.response?.data || error.message);
-      throw new Error(`Falha ao buscar contatos: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Buscar mensagens de um chat
-   */
-  async fetchMessages(instanceName: string, remoteJid: string, limit: number = 50): Promise<any> {
-    try {
-      const response = await this.client.get(`/chat/fetchMessages/${instanceName}`, {
-        params: {
-          remoteJid,
-          limit,
-        },
-      });
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao buscar mensagens:', error.response?.data || error.message);
-      throw new Error(`Falha ao buscar mensagens: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Marcar mensagem como lida
-   */
-  async markMessageAsRead(instanceName: string, remoteJid: string, messageId: string): Promise<any> {
-    try {
-      const response = await this.client.post(`/chat/markMessageAsRead/${instanceName}`, {
-        remoteJid,
-        messageId,
-      });
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao marcar como lida:', error.response?.data || error.message);
-      throw new Error(`Falha ao marcar como lida: ${error.response?.data?.message || error.message}`);
-    }
-  }
-
-  /**
-   * Configurar webhook para receber mensagens
-   */
-  async setWebhook(instanceName: string, webhookUrl: string, events: string[] = ['messages.upsert']): Promise<any> {
-    try {
-      const response = await this.client.post(`/webhook/set/${instanceName}`, {
-        url: webhookUrl,
-        events,
-        webhook_by_events: true,
-      });
-      return response.data;
-    } catch (error: any) {
-      console.error('[Evolution API] Erro ao configurar webhook:', error.response?.data || error.message);
-      throw new Error(`Falha ao configurar webhook: ${error.response?.data?.message || error.message}`);
-    }
-  }
-}
-
-// Singleton instance
-let evolutionApiInstance: EvolutionApiService | null = null;
-
-export function getEvolutionApi(): EvolutionApiService {
-  if (!evolutionApiInstance) {
-    const baseUrl = process.env.EVOLUTION_API_URL || 'http://localhost:8080';
-    const apiKey = process.env.EVOLUTION_API_KEY || '';
-
-    if (!apiKey) {
-      throw new Error('EVOLUTION_API_KEY não configurada. Configure via webdev_request_secrets.');
-    }
-
-    evolutionApiInstance = new EvolutionApiService({
-      baseUrl,
-      apiKey,
-    });
-  }
-
-  return evolutionApiInstance;
-}
+};

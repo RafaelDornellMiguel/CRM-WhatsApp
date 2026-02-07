@@ -1,251 +1,218 @@
-/**
- * Inbox - Lista de conversas estilo Whaticket com dados reais do banco
- * Design Philosophy: Minimalismo Corporativo
- * Integração com Evolution API e PostgreSQL
- */
-
 import { useState } from 'react';
-import { useLocation } from 'wouter';
+import { useLocation } from 'wouter'; 
 import { trpc } from '@/lib/trpc';
 import { useAuth } from '@/_core/hooks/useAuth';
-import { Search, MessageCircle, CheckCircle2, Filter, Users, Lock, Loader2, AlertCircle } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Card } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
+import { 
+  Search, MessageCircle, CheckCircle2, Users, Lock, 
+  Loader2, AlertCircle, User 
+} from 'lucide-react';
+
+// --- COMPONENTES UI SIMPLIFICADOS ---
+const Badge = ({ children, variant = 'default', className = '' }: any) => {
+  const bg = variant === 'secondary' || variant === 'resolvido' ? 'bg-gray-200 text-gray-800' : 
+             variant === 'destructive' ? 'bg-red-100 text-red-800' : 'bg-blue-100 text-blue-800';
+  return <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${bg} ${className}`}>{children}</span>;
+};
+
+const Input = ({ className = '', ...props }: any) => (
+  <input className={`flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${className}`} {...props} />
+);
 
 type TabType = 'abertos' | 'resolvidos' | 'busca';
 type FilterType = 'todos' | 'meus' | 'espera';
 
 export default function Inbox() {
   const [, setLocation] = useLocation();
+  
   const { user } = useAuth({ redirectOnUnauthenticated: true });
   const [activeTab, setActiveTab] = useState<TabType>('abertos');
   const [searchTerm, setSearchTerm] = useState('');
   const [filterType, setFilterType] = useState<FilterType>('todos');
 
-  // Fetch conversations from database
-  const { data: conversations = [], isLoading, error } = trpc.messages.listConversations.useQuery(
-    undefined,
-    { enabled: !!user }
+  // Busca conversas do Backend
+  const { data, isLoading, error, refetch } = trpc.messages.listConversations.useQuery(
+    undefined, 
+    { 
+      enabled: !!user,
+      refetchInterval: 5000 // Polling a cada 5s
+    }
   );
 
-  // Mark as read mutation
-  const markAsReadMutation = trpc.messages.markAsRead.useMutation();
+  // --- CORREÇÃO CRÍTICA AQUI ---
+  // Garante que 'conversations' seja sempre um array, mesmo se o backend mandar null
+  const conversations = Array.isArray(data) ? data : [];
+  // -----------------------------
 
-  // Filter conversations
+  // Filtros Lógicos
   const filteredConversations = conversations
-    .filter((conv) => {
-      // Filter by tab (status)
+    .filter((conv: any) => {
+      // 1. Filtro por Aba (Status)
       const status = conv.ticketStatus || 'aberto';
       if (activeTab === 'abertos') return status === 'aberto';
       if (activeTab === 'resolvidos') return status === 'resolvido';
-      return true;
+      return true; // Busca mostra tudo
     })
-    .filter((conv) => {
-      // Filter by type
+    .filter((conv: any) => {
+      // 2. Filtro por Responsável
       if (filterType === 'meus') return conv.vendedorId === user?.id;
-      if (filterType === 'espera') return false; // TODO: Implementar contador de não lidas
+      if (filterType === 'espera') return false; 
       return true;
     })
-    .filter((conv) => {
-      // Filter by search
+    .filter((conv: any) => {
+      // 3. Filtro de Texto (Busca)
       if (!searchTerm) return true;
+      const term = searchTerm.toLowerCase();
       return (
-        conv.nome.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        conv.telefone.includes(searchTerm)
+        (conv.nome || '').toLowerCase().includes(term) ||
+        (conv.telefone || '').includes(term)
       );
     });
 
   const handleSelectConversation = (contatoId: number) => {
-    // Mark as read
-    markAsReadMutation.mutate({ contatoId });
-    // Navigate to chat
-    setLocation(`/chat?contatoId=${contatoId}`);
+    setLocation(`/chat/${contatoId}`); 
   };
 
-  const handleToggleStatus = (contatoId: number, currentStatus: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    // TODO: Implement toggle status mutation
-  };
+  // Contadores seguros
+  const abertosCount = conversations.filter((c: any) => (c.ticketStatus || 'aberto') === 'aberto').length;
+  const resolvidosCount = conversations.filter((c: any) => c.ticketStatus === 'resolvido').length;
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+      <div className="flex items-center justify-center h-full bg-gray-50">
+        <Loader2 className="w-10 h-10 animate-spin text-primary" />
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <AlertCircle className="w-12 h-12 text-destructive mx-auto mb-4" />
-          <p className="text-muted-foreground">Erro ao carregar conversas</p>
-        </div>
+      <div className="flex flex-col items-center justify-center h-full text-center p-6">
+        <AlertCircle className="w-12 h-12 text-red-500 mb-4" />
+        <h3 className="text-lg font-semibold">Erro ao carregar</h3>
+        <p className="text-muted-foreground mb-4">{error.message}</p>
+        <button onClick={() => refetch()} className="px-4 py-2 bg-primary text-white rounded">
+          Tentar Novamente
+        </button>
       </div>
     );
   }
 
-  const abertosCount = conversations.filter((c) => c.ticketStatus === 'aberto').length;
-  const resolvidosCount = conversations.filter((c) => c.ticketStatus === 'resolvido').length;
-  const emEsperaCount = 0; // TODO: Implementar contador de não lidas
-
   return (
-    <div className="flex flex-col h-full bg-background">
-      {/* Header */}
-      <div className="p-4 border-b border-border bg-card">
-        <h1 className="text-2xl font-bold text-foreground mb-4">Conversas</h1>
+    <div className="flex flex-col h-full bg-white">
+      {/* --- HEADER --- */}
+      <div className="border-b px-4 py-3 bg-white">
+        <h1 className="text-xl font-bold mb-4">Inbox</h1>
 
-        {/* Tabs */}
-        <div className="flex gap-2 mb-4 border-b border-border">
+        {/* Abas Superiores */}
+        <div className="flex gap-1 bg-gray-100 p-1 rounded-lg mb-4">
           <button
             onClick={() => setActiveTab('abertos')}
-            className={`flex items-center gap-2 px-4 py-2 font-medium transition-colors ${
-              activeTab === 'abertos'
-                ? 'text-primary border-b-2 border-primary'
-                : 'text-muted-foreground hover:text-foreground'
+            className={`flex-1 flex items-center justify-center gap-2 py-2 text-sm font-medium rounded-md transition-all ${
+              activeTab === 'abertos' ? 'bg-white shadow text-blue-600' : 'text-gray-500 hover:bg-gray-200'
             }`}
           >
             <MessageCircle className="w-4 h-4" />
-            ABERTOS
-            <Badge variant="secondary" className="ml-2">
-              {abertosCount}
-            </Badge>
+            Abertos
+            <Badge className="ml-1">{abertosCount}</Badge>
           </button>
+
           <button
             onClick={() => setActiveTab('resolvidos')}
-            className={`flex items-center gap-2 px-4 py-2 font-medium transition-colors ${
-              activeTab === 'resolvidos'
-                ? 'text-primary border-b-2 border-primary'
-                : 'text-muted-foreground hover:text-foreground'
+            className={`flex-1 flex items-center justify-center gap-2 py-2 text-sm font-medium rounded-md transition-all ${
+              activeTab === 'resolvidos' ? 'bg-white shadow text-green-600' : 'text-gray-500 hover:bg-gray-200'
             }`}
           >
             <CheckCircle2 className="w-4 h-4" />
-            RESOLVIDOS
-            <Badge variant="secondary" className="ml-2">
-              {resolvidosCount}
-            </Badge>
+            Resolvidos
+            <Badge variant="secondary" className="ml-1">{resolvidosCount}</Badge>
           </button>
+
           <button
             onClick={() => setActiveTab('busca')}
-            className={`flex items-center gap-2 px-4 py-2 font-medium transition-colors ${
-              activeTab === 'busca'
-                ? 'text-primary border-b-2 border-primary'
-                : 'text-muted-foreground hover:text-foreground'
+            className={`flex-1 flex items-center justify-center gap-2 py-2 text-sm font-medium rounded-md transition-all ${
+              activeTab === 'busca' ? 'bg-white shadow text-gray-800' : 'text-gray-500 hover:bg-gray-200'
             }`}
           >
             <Search className="w-4 h-4" />
-            BUSCA
+            Busca
           </button>
         </div>
 
-        {/* Search and Filters */}
-        <div className="flex gap-3 items-center">
-          <div className="flex-1 relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+        {/* Barra de Busca e Filtros Rápidos */}
+        <div className="flex flex-col md:flex-row gap-3">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-2.5 h-4 w-4 text-gray-400" />
             <Input
-              placeholder="Nome, número ou email"
+              placeholder="Buscar nome ou telefone..."
               value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="pl-10"
+              onChange={(e: any) => setSearchTerm(e.target.value)}
+              className="pl-9"
             />
           </div>
+          
           <div className="flex gap-2">
             <button
               onClick={() => setFilterType('todos')}
-              className={`px-3 py-2 rounded-lg font-medium transition-colors ${
-                filterType === 'todos'
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80'
-              }`}
+              className={`px-3 py-2 text-xs font-medium rounded border ${filterType === 'todos' ? 'bg-gray-800 text-white' : 'bg-white text-gray-700'}`}
             >
               Todos
             </button>
             <button
               onClick={() => setFilterType('meus')}
-              className={`px-3 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 ${
-                filterType === 'meus'
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80'
-              }`}
+              className={`px-3 py-2 text-xs font-medium rounded border flex items-center gap-1 ${filterType === 'meus' ? 'bg-gray-800 text-white' : 'bg-white text-gray-700'}`}
             >
-              <Users className="w-4 h-4" />
-              Meus chats
-            </button>
-            <button
-              onClick={() => setFilterType('espera')}
-              className={`px-3 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 ${
-                filterType === 'espera'
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80'
-              }`}
-            >
-              <Lock className="w-4 h-4" />
-              Em espera
-              {emEsperaCount > 0 && (
-                <Badge variant="destructive" className="ml-1">
-                  {emEsperaCount}
-                </Badge>
-              )}
+              <User className="w-3 h-3" /> Meus
             </button>
           </div>
         </div>
       </div>
 
-      {/* Conversations List */}
+      {/* --- LISTA DE CONVERSAS --- */}
       <div className="flex-1 overflow-y-auto">
         {filteredConversations.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-muted-foreground">
-            <p>Nenhuma conversa encontrada</p>
+          <div className="flex flex-col items-center justify-center h-full text-gray-400 p-8 text-center">
+            <MessageCircle className="w-12 h-12 mb-2 opacity-20" />
+            <p>Nenhuma conversa encontrada nesta aba.</p>
           </div>
         ) : (
-          <div className="divide-y divide-border">
-            {filteredConversations.map((conv) => (
-              <Card
+          <div className="divide-y divide-gray-100">
+            {filteredConversations.map((conv: any) => (
+              <div
                 key={conv.id}
                 onClick={() => handleSelectConversation(conv.id)}
-                className="rounded-none border-0 border-b border-border cursor-pointer hover:bg-muted/50 transition-colors p-4"
+                className="flex items-center gap-3 p-4 hover:bg-gray-50 cursor-pointer transition-colors group"
               >
-                <div className="flex items-start justify-between gap-4">
-                  {/* Avatar and Info */}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-3 mb-2">
-                      <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center flex-shrink-0">
-                        <span className="text-sm font-semibold text-primary">
-                          {conv.nome.charAt(0).toUpperCase()}
-                        </span>
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <h3 className="font-semibold text-foreground truncate">{conv.nome}</h3>
-                        <p className="text-sm text-muted-foreground">{conv.telefone}</p>
-                      </div>
-                    </div>
-                    <p className="text-sm text-muted-foreground truncate ml-14">
-                      Última mensagem aqui
-                    </p>
-                  </div>
+                {/* Avatar */}
+                <div className="relative">
+                    {conv.avatar ? (
+                        <img src={conv.avatar} alt={conv.nome} className="w-12 h-12 rounded-full object-cover border border-gray-200" />
+                    ) : (
+                        <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center text-gray-500 font-bold text-lg border border-gray-200">
+                        {(conv.nome || '?').charAt(0).toUpperCase()}
+                        </div>
+                    )}
+                    {/* Status Dot (Online/Offline - Simulado) */}
+                    <span className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-white rounded-full"></span>
+                </div>
 
-                  {/* Status and Unread */}
-                  <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                    <Badge
-                      variant={conv.ticketStatus === 'resolvido' ? 'secondary' : 'default'}
-                      className="capitalize"
-                    >
-                      {conv.ticketStatus === 'resolvido' ? 'Resolvido' : 'Aberto'}
-                    </Badge>
-                    <p className="text-xs text-muted-foreground">
-                      {new Date(conv.updatedAt).toLocaleDateString('pt-BR', {
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
+                {/* Info Central */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex justify-between items-start mb-1">
+                    <h3 className="font-semibold text-gray-900 truncate pr-2">
+                      {conv.nome || conv.telefone}
+                    </h3>
+                    <span className="text-xs text-gray-400 whitespace-nowrap">
+                        {new Date(conv.updatedAt || new Date()).toLocaleDateString('pt-BR', { hour: '2-digit', minute:'2-digit' })}
+                    </span>
+                  </div>
+                  
+                  <div className="flex justify-between items-center">
+                    <p className="text-sm text-gray-500 truncate max-w-[80%]">
+                      {conv.telefone}
                     </p>
                   </div>
                 </div>
-              </Card>
+              </div>
             ))}
           </div>
         )}

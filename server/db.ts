@@ -1,32 +1,34 @@
-import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users, empresas, InsertEmpresa } from "../drizzle/schema";
+import mysql from "mysql2/promise";
+import * as schema from "../drizzle/schema"; // Importa o schema completo para o Drizzle conhecer suas tabelas
+import { eq } from "drizzle-orm";
+import { users, empresas, contatos, mensagens, InsertUser, InsertEmpresa, InsertContato, InsertMensagem } from "../drizzle/schema";
 import { ENV } from './_core/env';
 
-let _db: ReturnType<typeof drizzle> | null = null;
+/**
+ * CONFIGURAÇÃO DO BANCO DE DADOS
+ * Padrão Singleton para conexão MySQL
+ */
 
-// Lazily create the drizzle instance so local tooling can run without a DB.
-export async function getDb() {
-  if (!_db && process.env.DATABASE_URL) {
-    try {
-      _db = drizzle(process.env.DATABASE_URL);
-    } catch (error) {
-      console.warn("[Database] Failed to connect:", error);
-      _db = null;
-    }
-  }
-  return _db;
+// Validação da URL
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL não foi definida nas variáveis de ambiente");
 }
+
+// Criamos o pool de conexões (Melhor performance que conexão única)
+const poolConnection = mysql.createPool(process.env.DATABASE_URL);
+
+// Exportamos a instância 'db' diretamente. 
+// Isso corrige o erro vermelho nos outros arquivos.
+export const db = drizzle(poolConnection, { schema, mode: "default" });
+
+// ============================================
+// HELPERS DE USUÁRIO
+// ============================================
 
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) {
     throw new Error("User openId is required for upsert");
-  }
-
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot upsert user: database not available");
-    return;
   }
 
   try {
@@ -39,11 +41,10 @@ export async function upsertUser(user: InsertUser): Promise<void> {
         tenantId = empresaDefault[0]!.id;
       } else {
         // Criar empresa padrão
-        const novaEmpresa: InsertEmpresa = {
-          nome: "Empresa Padrão",
+        const result = await db.insert(empresas).values({
+          nome: "Minha Empresa",
           ativo: true,
-        };
-        const result = await db.insert(empresas).values(novaEmpresa);
+        });
         tenantId = Number(result[0].insertId);
       }
     }
@@ -52,25 +53,24 @@ export async function upsertUser(user: InsertUser): Promise<void> {
       openId: user.openId,
       tenantId,
     };
-    const updateSet: Record<string, unknown> = {};
-
+    
+    // Preparar campos para atualização
+    const updateSet: any = {};
     const textFields = ["name", "email", "loginMethod"] as const;
-    type TextField = (typeof textFields)[number];
 
-    const assignNullable = (field: TextField) => {
-      const value = user[field];
-      if (value === undefined) return;
-      const normalized = value ?? null;
-      values[field] = normalized;
-      updateSet[field] = normalized;
-    };
-
-    textFields.forEach(assignNullable);
+    textFields.forEach((field) => {
+      if (user[field] !== undefined) {
+        values[field] = user[field] ?? null;
+        updateSet[field] = user[field] ?? null;
+      }
+    });
 
     if (user.lastSignedIn !== undefined) {
       values.lastSignedIn = user.lastSignedIn;
       updateSet.lastSignedIn = user.lastSignedIn;
     }
+
+    // Definir Admin se for o dono
     if (user.role !== undefined) {
       values.role = user.role;
       updateSet.role = user.role;
@@ -83,13 +83,11 @@ export async function upsertUser(user: InsertUser): Promise<void> {
       values.lastSignedIn = new Date();
     }
 
-    if (Object.keys(updateSet).length === 0) {
-      updateSet.lastSignedIn = new Date();
-    }
-
+    // Upsert (Insert ou Update se existir)
     await db.insert(users).values(values).onDuplicateKeyUpdate({
       set: updateSet,
     });
+    
   } catch (error) {
     console.error("[Database] Failed to upsert user:", error);
     throw error;
@@ -97,48 +95,22 @@ export async function upsertUser(user: InsertUser): Promise<void> {
 }
 
 export async function getUserByOpenId(openId: string) {
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get user: database not available");
-    return undefined;
-  }
-
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
-
   return result.length > 0 ? result[0] : undefined;
 }
 
-// TODO: add feature queries here as your schema grows.
-
 // ============================================
-// CONTATOS
+// HELPER DE CONTATOS (Mantendo compatibilidade)
 // ============================================
-
-import { contatos, InsertContato, mensagens, InsertMensagem } from "../drizzle/schema";
-import { desc } from "drizzle-orm";
 
 export async function getContatosByEmpresaId(tenantId: number) {
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get contatos: database not available");
-    return [];
-  }
-
-  const result = await db
+  return await db
     .select()
     .from(contatos)
     .where(eq(contatos.tenantId, tenantId));
-
-  return result;
 }
 
 export async function getContatoByTelefone(telefone: string) {
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get contato: database not available");
-    return undefined;
-  }
-
   const result = await db
     .select()
     .from(contatos)
@@ -149,15 +121,9 @@ export async function getContatoByTelefone(telefone: string) {
 }
 
 export async function createContato(data: InsertContato) {
-  const db = await getDb();
-  if (!db) {
-    throw new Error("[Database] Cannot create contato: database not available");
-  }
-
   const result = await db.insert(contatos).values(data);
   const insertId = Number(result[0].insertId);
 
-  // Buscar contato criado
   const created = await db
     .select()
     .from(contatos)
@@ -168,35 +134,21 @@ export async function createContato(data: InsertContato) {
 }
 
 // ============================================
-// MENSAGENS
+// HELPER DE MENSAGENS
 // ============================================
 
 export async function getMensagensByContatoId(contatoId: number) {
-  const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get mensagens: database not available");
-    return [];
-  }
-
-  const result = await db
+  return await db
     .select()
     .from(mensagens)
     .where(eq(mensagens.contatoId, contatoId))
     .orderBy(mensagens.createdAt);
-
-  return result;
 }
 
 export async function createMensagem(data: InsertMensagem) {
-  const db = await getDb();
-  if (!db) {
-    throw new Error("[Database] Cannot create mensagem: database not available");
-  }
-
   const result = await db.insert(mensagens).values(data);
   const insertId = Number(result[0].insertId);
 
-  // Buscar mensagem criada
   const created = await db
     .select()
     .from(mensagens)
@@ -207,11 +159,6 @@ export async function createMensagem(data: InsertMensagem) {
 }
 
 export async function markMensagensAsRead(contatoId: number) {
-  const db = await getDb();
-  if (!db) {
-    throw new Error("[Database] Cannot mark mensagens as read: database not available");
-  }
-
   await db
     .update(mensagens)
     .set({ lida: true })

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { protectedProcedure, router } from './_core/trpc';
-import { getDb } from './db';
+import { db } from './db'; // Importando direto, sem getDb()
 import { contatos } from '../drizzle/schema';
 import { eq } from 'drizzle-orm';
 
@@ -8,17 +8,10 @@ export const leadsRouter = router({
   list: protectedProcedure
     .input(z.object({ tenantId: z.number().optional() }).optional())
     .query(async ({ ctx, input }) => {
-      const db = await getDb();
-      if (!db) return [];
-
       const tenantId = input?.tenantId || ctx.user?.tenantId || 1;
-
-      const result = await db
-        .select()
-        .from(contatos)
-        .where(eq(contatos.tenantId, tenantId));
-
-      return result;
+      
+      // db já está pronto, não precisa de await getDb()
+      return await db.select().from(contatos).where(eq(contatos.tenantId, tenantId));
     }),
 
   create: protectedProcedure
@@ -33,9 +26,6 @@ export const leadsRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const db = await getDb();
-      if (!db) throw new Error('Database not available');
-
       const tenantId = input.tenantId || ctx.user?.tenantId || 1;
 
       const result = await db.insert(contatos).values({
@@ -49,7 +39,6 @@ export const leadsRouter = router({
         createdAt: new Date(),
         updatedAt: new Date(),
       });
-
       return result;
     }),
 
@@ -65,17 +54,11 @@ export const leadsRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const db = await getDb();
-      if (!db) throw new Error('Database not available');
-
       const { id, ...updateData } = input;
 
       const result = await db
         .update(contatos)
-        .set({
-          ...updateData,
-          updatedAt: new Date(),
-        })
+        .set({ ...updateData, updatedAt: new Date() })
         .where(eq(contatos.id, id));
 
       return result;
@@ -83,27 +66,18 @@ export const leadsRouter = router({
 
   delete: protectedProcedure
     .input(z.object({ id: z.number() }))
-    .mutation(async ({ ctx, input }) => {
-      const db = await getDb();
-      if (!db) throw new Error('Database not available');
-
-      const result = await db.delete(contatos).where(eq(contatos.id, input.id));
-
-      return result;
+    .mutation(async ({ input }) => {
+      return await db.delete(contatos).where(eq(contatos.id, input.id));
     }),
 
   getById: protectedProcedure
     .input(z.object({ id: z.number() }))
-    .query(async ({ ctx, input }) => {
-      const db = await getDb();
-      if (!db) return null;
-
+    .query(async ({ input }) => {
       const result = await db
         .select()
         .from(contatos)
         .where(eq(contatos.id, input.id))
         .limit(1);
-
       return result[0] || null;
     }),
 
@@ -114,18 +88,10 @@ export const leadsRouter = router({
         status: z.enum(['novo', 'em_atendimento', 'convertido', 'perdido']),
       })
     )
-    .mutation(async ({ ctx, input }) => {
-      const db = await getDb();
-      if (!db) throw new Error('Database not available');
-
-      const result = await db
+    .mutation(async ({ input }) => {
+      return await db
         .update(contatos)
-        .set({
-          status: input.status,
-          updatedAt: new Date(),
-        })
+        .set({ status: input.status, updatedAt: new Date() })
         .where(eq(contatos.id, input.id));
-
-      return result;
     }),
 });

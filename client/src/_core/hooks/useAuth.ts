@@ -21,20 +21,26 @@ function isBrowser() {
 
 function samePathAsCurrent(urlString: string) {
   if (!isBrowser()) return false;
-  const url = new URL(urlString, window.location.origin);
-  return window.location.pathname === url.pathname;
+  try {
+    const url = new URL(urlString, window.location.origin);
+    return window.location.pathname === url.pathname;
+  } catch {
+    return false;
+  }
 }
 
 export function useAuth(options?: UseAuthOptions) {
   const utils = trpc.useUtils();
 
-  // resolve o redirect uma vez por render (com default sensato)
+  // Define valores padrão
   const redirectPath = options?.redirectPath ?? getLoginUrl();
   const redirectOnUnauthenticated = options?.redirectOnUnauthenticated ?? false;
 
   const meQuery = trpc.auth.me.useQuery(undefined, {
     retry: false,
     refetchOnWindowFocus: false,
+    // Importante: Cache de 5 minutos evita "piscadas" e chamadas excessivas
+    staleTime: 1000 * 60 * 5, 
   });
 
   const logoutMutation = trpc.auth.logout.useMutation({
@@ -47,12 +53,15 @@ export function useAuth(options?: UseAuthOptions) {
     try {
       await logoutMutation.mutateAsync();
     } catch (error: unknown) {
-      // se já está deslogado, não explode
       if (isUnauthorized(error)) return;
       throw error;
     } finally {
       utils.auth.me.setData(undefined, null);
       await utils.auth.me.invalidate();
+      // Opcional: Forçar ir para login após logout
+      if (isBrowser()) {
+        window.location.href = getLoginUrl();
+      }
     }
   }, [logoutMutation, utils]);
 
@@ -61,9 +70,12 @@ export function useAuth(options?: UseAuthOptions) {
     const loading = meQuery.isLoading || logoutMutation.isPending;
     const error = meQuery.error ?? logoutMutation.error ?? null;
 
-    // só persiste quando tem dado ou quando terminou (evita escrever "undefined" o tempo todo)
     if (isBrowser() && !loading) {
-      localStorage.setItem("manus-runtime-user-info", JSON.stringify(user));
+      if (user) {
+        localStorage.setItem("manus-runtime-user-info", JSON.stringify(user));
+      } else {
+        localStorage.removeItem("manus-runtime-user-info");
+      }
     }
 
     return {
@@ -81,14 +93,23 @@ export function useAuth(options?: UseAuthOptions) {
   ]);
 
   useEffect(() => {
+    // Se a opção de redirecionar estiver desligada, não faz nada
     if (!redirectOnUnauthenticated) return;
+    
     if (!isBrowser()) return;
+
+    // CRÍTICO: Se ainda está carregando, PARE AQUI.
+    // Isso evita o redirecionamento prematuro antes de saber se o user existe.
     if (state.loading) return;
+
+    // Se o usuário existe, não precisa redirecionar
     if (state.user) return;
 
-    // evita loop caso já esteja na rota de login
+    // Proteção contra loop infinito: se já estamos na página de login, pare.
     if (samePathAsCurrent(redirectPath)) return;
 
+    // Se chegou até aqui: não está carregando, não tem user e não está no login.
+    console.log("[Auth] Sessão não encontrada. Redirecionando...");
     window.location.href = redirectPath;
   }, [redirectOnUnauthenticated, redirectPath, state.loading, state.user]);
 

@@ -15,6 +15,15 @@ export const empresas = mysqlTable("empresas", {
   cnpj: varchar("cnpj", { length: 18 }),
   telefone: varchar("telefone", { length: 20 }),
   email: varchar("email", { length: 320 }),
+  
+  // --- INÍCIO DA ALTERAÇÃO ---
+  // Adicionamos estes campos como 'text' pois URLs e Tokens podem ser longos
+  // Não colocamos 'notNull()' porque a empresa pode ser criada sem ter configurado isso ainda
+  evolutionApiUrl: text("evolutionApiUrl"), 
+  evolutionApiKey: text("evolutionApiKey"),
+  // --- FIM DA ALTERAÇÃO ---
+  
+  
   ativo: boolean("ativo").default(true).notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),

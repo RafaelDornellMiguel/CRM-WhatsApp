@@ -1,329 +1,198 @@
 import { z } from "zod";
-import { protectedProcedure, router } from "./_core/trpc";
-import { getEvolutionApi } from "./evolutionApi";
-import { TRPCError } from "@trpc/server";
+import { router, protectedProcedure } from "./_core/trpc";
+import { db } from "./db";
+import { empresas, numerosWhatsapp } from "../drizzle/schema";
+import { eq, and } from "drizzle-orm";
+import { evolutionApi } from "./evolutionApi";
 
-/**
- * Router de WhatsApp com integração Evolution API
- */
+// --- Helpers ---
+
+// Busca credenciais e valida se a integração existe
+async function getCreds(tenantId: number) {
+  const [empresa] = await db
+    .select()
+    .from(empresas)
+    .where(eq(empresas.id, tenantId))
+    .limit(1);
+
+  if (!empresa || !empresa.evolutionApiUrl || !empresa.evolutionApiKey) {
+    throw new Error(
+      "Integração não configurada! Acesse Configurações > Integrações e configure a Evolution API."
+    );
+  }
+
+  return {
+    baseUrl: empresa.evolutionApiUrl,
+    apiKey: empresa.evolutionApiKey,
+  };
+}
+
 export const whatsappRouter = router({
-  /**
-   * Criar nova instância do WhatsApp
-   */
-  createInstance: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-        token: z.string().optional(),
-      })
-    )
-    .mutation(async ({ input, ctx }) => {
-      try {
-        const api = getEvolutionApi();
-        const result = await api.createInstance({
-          instanceName: input.instanceName,
-          token: input.token,
-          qrcode: true,
-        });
+  // 1. LISTAR CONEXÕES
+  listConnections: protectedProcedure.query(async ({ ctx }) => {
+    const tenantId = ctx.user.tenantId || 1;
 
-        return {
-          success: true,
-          data: result,
-        };
+    const conexoes = await db
+      .select()
+      .from(numerosWhatsapp)
+      .where(eq(numerosWhatsapp.tenantId, tenantId));
+
+    return conexoes.map((c) => ({
+      id: c.id,
+      instanceName: c.nome,
+      status: c.status,
+      qrCode: c.qrCode,
+      updatedAt: c.updatedAt,
+    }));
+  }),
+
+  // 2. CRIAR INSTÂNCIA (Upsert Inteligente)
+  createConnection: protectedProcedure
+    .input(z.object({ instanceName: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      const tenantId = ctx.user.tenantId || 1;
+      const creds = await getCreds(tenantId);
+
+      // Webhook URL para receber eventos
+      const webhookUrl = process.env.APP_URL
+        ? `${process.env.APP_URL}/api/webhook`
+        : undefined;
+
+      try {
+        console.log(`[WhatsApp] Criando instância: ${input.instanceName}`);
+
+        // A. Tenta criar na Evolution
+        // Se já existir, a API pode dar erro ou retornar sucesso dependendo da versão.
+        // O evolutionApi.ts que fizemos já trata o "already exists" sem lançar erro fatal.
+        await evolutionApi.createInstance(creds, input.instanceName, webhookUrl);
+
+        // B. Busca o QR Code (Connect)
+        const connectionData = await evolutionApi.connectInstance(
+          creds,
+          input.instanceName
+        );
+
+        // C. Salva ou Atualiza no Banco (Lógica Upsert Manual)
+        // Verificamos se já existe um registro para este tenant + nome
+        const [existingNumber] = await db
+          .select()
+          .from(numerosWhatsapp)
+          .where(
+            and(
+              eq(numerosWhatsapp.tenantId, tenantId),
+              eq(numerosWhatsapp.nome, input.instanceName)
+            )
+          );
+
+        const statusInicial = "aguardando";
+        const qrCodeBase64 = connectionData?.base64 || connectionData?.code || null;
+
+        if (!existingNumber) {
+          // INSERT
+          await db.insert(numerosWhatsapp).values({
+            tenantId,
+            nome: input.instanceName,
+            numero: "Carregando...",
+            status: statusInicial,
+            qrCode: qrCodeBase64,
+          });
+        } else {
+          // UPDATE
+          await db
+            .update(numerosWhatsapp)
+            .set({
+              qrCode: qrCodeBase64,
+              status: statusInicial,
+              updatedAt: new Date(),
+            })
+            .where(eq(numerosWhatsapp.id, existingNumber.id));
+        }
+
+        return { success: true, qrCode: qrCodeBase64 };
       } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao criar instância",
-        });
+        console.error("[WhatsApp Error]", error);
+        // Retorna erro amigável para o frontend
+        throw new Error(
+          error.message || "Erro ao conectar com o WhatsApp. Verifique os logs."
+        );
       }
     }),
 
-  /**
-   * Conectar instância e obter QR Code
-   */
-  connectInstance: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-      })
-    )
-    .mutation(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        const result = await api.connectInstance(input.instanceName);
-
-        return {
-          success: true,
-          qrCode: result.base64,
-          code: result.code,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao conectar instância",
-        });
-      }
-    }),
-
-  /**
-   * Obter status de conexão da instância
-   */
+  // 3. PEGAR STATUS (Com Auto-Refresh de QR Code)
   getConnectionState: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-      })
-    )
-    .query(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        const result = await api.getConnectionState(input.instanceName);
+    .input(z.object({ instanceName: z.string() }))
+    .query(async ({ ctx, input }) => {
+      const tenantId = ctx.user.tenantId || 1;
+      const creds = await getCreds(tenantId);
 
-        return {
-          success: true,
-          state: result.state,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao verificar conexão",
-        });
+      // A. Busca status real na API
+      const stateData = await evolutionApi.fetchInstanceStatus(
+        creds,
+        input.instanceName
+      );
+      
+      // Normaliza o status (open, close, connecting)
+      const rawState = stateData?.instance?.state || "close";
+      const isConnected = rawState === "open";
+      const dbStatus = isConnected ? "conectado" : "desconectado";
+
+      // B. Se NÃO estiver conectado, tentamos renovar o QR Code
+      // Isso é vital: QR Codes expiram. Se o usuário estiver na tela, queremos o novo.
+      let newQrCode: string | null = null;
+      
+      if (!isConnected) {
+          const connectData = await evolutionApi.connectInstance(creds, input.instanceName);
+          if (connectData?.base64 || connectData?.code) {
+              newQrCode = connectData.base64 || connectData.code;
+          }
       }
-    }),
 
-  /**
-   * Desconectar instância (logout)
-   */
-  logoutInstance: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-      })
-    )
-    .mutation(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        await api.logoutInstance(input.instanceName);
-
-        return {
-          success: true,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao desconectar instância",
-        });
-      }
-    }),
-
-  /**
-   * Deletar instância
-   */
-  deleteInstance: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-      })
-    )
-    .mutation(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        await api.deleteInstance(input.instanceName);
-
-        return {
-          success: true,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao deletar instância",
-        });
-      }
-    }),
-
-  /**
-   * Enviar mensagem de texto
-   */
-  sendTextMessage: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-        number: z.string().min(1),
-        text: z.string().min(1),
-      })
-    )
-    .mutation(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        const result = await api.sendTextMessage(input.instanceName, {
-          number: input.number,
-          text: input.text,
-        });
-
-        return {
-          success: true,
-          data: result,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao enviar mensagem",
-        });
-      }
-    }),
-
-  /**
-   * Enviar mensagem com mídia
-   */
-  sendMediaMessage: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-        number: z.string().min(1),
-        mediaUrl: z.string().url(),
-        caption: z.string().optional(),
-        mediaType: z.enum(["image", "video", "audio", "document"]),
-      })
-    )
-    .mutation(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        const result = await api.sendMediaMessage(input.instanceName, {
-          number: input.number,
-          mediaUrl: input.mediaUrl,
-          caption: input.caption,
-          mediaType: input.mediaType,
-        });
-
-        return {
-          success: true,
-          data: result,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao enviar mídia",
-        });
-      }
-    }),
-
-  /**
-   * Buscar contatos da instância
-   */
-  fetchContacts: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-      })
-    )
-    .query(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        const result = await api.fetchContacts(input.instanceName);
-
-        return {
-          success: true,
-          contacts: result,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao buscar contatos",
-        });
-      }
-    }),
-
-  /**
-   * Buscar mensagens de um chat
-   */
-  fetchMessages: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-        remoteJid: z.string().min(1),
-        limit: z.number().optional().default(50),
-      })
-    )
-    .query(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        const result = await api.fetchMessages(
-          input.instanceName,
-          input.remoteJid,
-          input.limit
+      // C. Atualiza o banco com o status mais recente
+      await db
+        .update(numerosWhatsapp)
+        .set({ 
+            status: dbStatus,
+            // Só atualiza o QR Code se tivermos um novo, senão mantém (ou limpa se conectado)
+            qrCode: isConnected ? null : (newQrCode || undefined)
+        })
+        .where(
+          and(
+            eq(numerosWhatsapp.tenantId, tenantId),
+            eq(numerosWhatsapp.nome, input.instanceName)
+          )
         );
 
-        return {
-          success: true,
-          messages: result,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao buscar mensagens",
-        });
-      }
+      return { 
+          state: rawState, 
+          qrCode: newQrCode // Retorna o QR novo pro frontend atualizar sem refresh
+      };
     }),
 
-  /**
-   * Marcar mensagem como lida
-   */
-  markAsRead: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-        remoteJid: z.string().min(1),
-        messageId: z.string().min(1),
-      })
-    )
-    .mutation(async ({ input }) => {
+  // 4. DELETAR / DESCONECTAR
+  deleteConnection: protectedProcedure
+    .input(z.object({ instanceName: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      const tenantId = ctx.user.tenantId || 1;
+      const creds = await getCreds(tenantId);
+
       try {
-        const api = getEvolutionApi();
-        await api.markMessageAsRead(
-          input.instanceName,
-          input.remoteJid,
-          input.messageId
+        // Tenta fazer logout e deletar na Evolution
+        await evolutionApi.logoutInstance(creds, input.instanceName);
+        await evolutionApi.deleteInstance(creds, input.instanceName);
+      } catch (e) {
+        console.error("Erro ao remover da Evolution (pode já ter sido removido)", e);
+      }
+
+      // Remove do banco de dados local
+      await db
+        .delete(numerosWhatsapp)
+        .where(
+          and(
+            eq(numerosWhatsapp.tenantId, tenantId),
+            eq(numerosWhatsapp.nome, input.instanceName)
+          )
         );
 
-        return {
-          success: true,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao marcar como lida",
-        });
-      }
-    }),
-
-  /**
-   * Configurar webhook para receber mensagens
-   */
-  setWebhook: protectedProcedure
-    .input(
-      z.object({
-        instanceName: z.string().min(1),
-        webhookUrl: z.string().url(),
-        events: z.array(z.string()).optional(),
-      })
-    )
-    .mutation(async ({ input }) => {
-      try {
-        const api = getEvolutionApi();
-        await api.setWebhook(
-          input.instanceName,
-          input.webhookUrl,
-          input.events || ["messages.upsert"]
-        );
-
-        return {
-          success: true,
-        };
-      } catch (error: any) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: error.message || "Erro ao configurar webhook",
-        });
-      }
+      return { success: true };
     }),
 });
